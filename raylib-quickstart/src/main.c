@@ -57,8 +57,8 @@ Based on raylib-quickstart by Jeffery Myers (CC0 1.0).
  * that interacts with raylib's API, but Vec3 for pure data storage. Mixing
  * them would be fine too; keeping them separate makes the data layer obvious. */
 typedef struct { 
-	float x,
-	float y, 
+	float x;
+	float y; 
 	float z; } Vec3;
 
 /* ------------------------------------------------------------------ */
@@ -270,6 +270,14 @@ int main(void) {
     float simTimer = 0.0f;
     int   eof      = 0;   /* becomes 1 once the file is exhausted */
 
+	/* 
+	* True reference field for Toronto, ON (~0.53 Total Gauss)
+	* Mapping to Raylib: 
+	*   X_raylib = North (~0.189G)
+	*   Y_raylib = Up (-Down Component = -0.494G)
+	*   Z_raylib = East (~-0.031G due to -9.5° West Declination)
+	*/
+	static Vec3 earthRef = { 0.1890f, -0.4941f, -0.0316f }; 
     /* ---------------- main loop ---------------- */
     /* WindowShouldClose() returns true when the user clicks the close
      * button or presses ESC. */
@@ -342,6 +350,14 @@ int main(void) {
         DrawLine3D((Vector3){0,0,0}, tip, (Color){255, 220, 80, 255});
         DrawSphere(tip, 0.08f, (Color){255, 120, 40, 255});
         DrawSphere((Vector3){0,0,0}, 0.05f, RAYWHITE);
+
+		DrawLine3D((Vector3){0,0,0}, 
+		(Vector3){ earthRef.x * SCALE, earthRef.y * SCALE, earthRef.z * SCALE }, 
+		(Color){ 0, 200, 200, 255 }); // Cyan
+
+		// Optional: Add a small sphere at the tip for visibility
+		DrawSphere((Vector3){ earthRef.x * SCALE, earthRef.y * SCALE, earthRef.z * SCALE }, 
+				0.06f, (Color){ 0, 200, 200, 180 });
 
         EndMode3D();
 
