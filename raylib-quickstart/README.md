@@ -2,6 +2,8 @@
 A simple cross platform template for setting up a project with the bleeding edge raylib code.
 Works with C or C++.
 
+<img width="1097" height="768" alt="image" src="https://github.com/user-attachments/assets/3ba54c91-4c5e-4626-97d0-366c9537f336" />
+
 # Basic Setup
 Download this repository to get started.
 
