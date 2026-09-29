@@ -417,7 +417,7 @@ raylib-master
 build/external/
 
 # Premake-generated makefiles (Makefile is above; these are the per-target ones)
-*.make
+#*.make
 
 # Visual Studio 2026 solution format + generated VC++ project files at repo root
 /*.slnx

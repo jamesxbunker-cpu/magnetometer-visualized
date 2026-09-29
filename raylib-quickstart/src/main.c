@@ -1,101 +1,68 @@
 /*
-Magnetometer 3D plotter
-Reads whitespace-separated samples from resources/data/magnetometer_data.txt
-and renders the magnetic field vector, a fading trail of past samples, and a
-reference sphere at the mean |B| radius.
+Magnetometer 3D plotter - live version
+Reads whitespace-separated samples from a COM port and renders the magnetic
+field vector, a fading trail of past samples, and a reference sphere at the
+mean |B| radius.
 
-File format (one sample per line, 7 whitespace-separated numbers):
+Expected line format (same as the file version):
     rawX rawY rawZ gaussX gaussY gaussZ tempC
-
-Only columns 4, 5, 6 (gaussX/Y/Z) and column 7 (tempC) are used for rendering.
-Columns 1-3 are kept for lossless round-tripping of the source data.
+with CRLF or LF line endings.
 
 Based on raylib-quickstart by Jeffery Myers (CC0 1.0).
 */
 
 #include "raylib.h"
-#include "resource_dir.h"   /* SearchAndSetResourceDir: chdir helper from quickstart */
+#include "resource_dir.h"    /* SearchAndSetResourceDir */
+#include "comport.h"         /* <-- NEW: our library */
 
-#include <stdio.h>          /* fopen, fgets, sscanf, fprintf */
-#include <stdlib.h>         /* (nothing used here yet, but harmless) */
-#include <string.h>         /* memmove */
-#include <math.h>           /* sqrtf, sinf, cosf, PI (from raylib) */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
 
 /* ------------------------------------------------------------------ */
 /*  Tunable constants                                                 */
 /* ------------------------------------------------------------------ */
 
-/* How many past samples to remember for the trail.
- * The trail buffer is a ring; once it fills, the oldest sample is dropped. */
 #define MAX_TRAIL      2000
-
-/* World-units per gauss. A typical Earth field is ~0.5 gauss; multiplying
- * by 5 makes the vector span ~2.5 world units, which is comfortably visible
- * against the default grid (which is 10 units across). */
 #define SCALE          5.0f
-
-/* Playback rate: how many samples per second of wall-clock time get consumed.
- * Independent of the render rate (60 fps via SetTargetFPS below). */
-#define PLAYBACK_HZ    20.0f
-
-/* Fallback |B| used for the reference sphere until we have enough samples to
- * compute a meaningful running mean. Earth's field is roughly 0.25-0.65 gauss
- * depending on location; 0.92 matches the sample data in this project. */
 #define DEFAULT_REF_B  0.92f
-
-/* Reference-sphere mesh density. More rings/slices = smoother sphere but more
- * line segments per frame. 8x12 is a good balance for a single reference
- * shell. */
 #define SPHERE_RINGS   8
 #define SPHERE_SLICES  12
+
+/* COM port settings. Change via command line or hardcode here. */
+#define DEFAULT_PORT   "COM3"
+#define DEFAULT_BAUD   115200
+
+/* Max bytes per comport_read call. The STM32 likely sends one line per
+ * transmission (~60 bytes), but we allow up to 512 in case it batches. */
+#define RX_CHUNK       512
+
+/* Line buffer capacity. A single sample line is ~60-70 chars; 512 gives
+ * plenty of headroom for malformed lines or slow accumulation. */
+#define LINE_BUF       512
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
 /* ------------------------------------------------------------------ */
 
-/* Three floats, our minimal 3D vector. We use raylib's Vector3 for anything
- * that interacts with raylib's API, but Vec3 for pure data storage. Mixing
- * them would be fine too; keeping them separate makes the data layer obvious. */
-typedef struct { 
-	float x;
-	float y; 
-	float z; } Vec3;
+typedef struct { float x, y, z; } Vec3;
 
 /* ------------------------------------------------------------------ */
-/*  Playback state (module-static, so no globals across files)        */
+/*  Playback state                                                    */
 /* ------------------------------------------------------------------ */
 
-/* Ring buffer of past samples, used to draw the fading trail. */
 static Vec3  trail[MAX_TRAIL];
 static int   trailCount = 0;
-
-/* Most recent sample read from the file. Starts at origin so the first frame
- * (before any sample has been read) draws something sensible. */
 static Vec3  current = {0};
 static float tempC   = 0.0f;
-
-/* Running mean of |B|, used to size the reference sphere to the data rather
- * than to a hardcoded value. Uses Welford's incremental-mean formula:
- *   mean += (x - mean) / n
- * This is numerically more stable than summing-and-dividing, and lets us
- * update in O(1) without storing all samples. */
-static float meanMag  = 0.0f;
+static float meanMag = 0.0f;
 static int   magCount = 0;
 
 /* ------------------------------------------------------------------ */
 /*  Parsing                                                           */
 /* ------------------------------------------------------------------ */
 
-/*
- * Try to parse one line of the form:
- *     rawX rawY rawZ gaussX gaussY gaussZ tempC
- * into the output Vec3 and temp. Returns 1 on success, 0 on failure.
- *
- * sscanf returns the number of successful conversions. We demand all seven.
- * Lines that don't parse (blank lines, comments, the header row if present)
- * will produce fewer than 7 conversions and be rejected — that's how we skip
- * them without special-casing.
- */
 static int parseLine(const char *line, Vec3 *out, float *t) {
     float rx, ry, rz;
     return sscanf(line, "%f %f %f %f %f %f %f",
@@ -103,54 +70,19 @@ static int parseLine(const char *line, Vec3 *out, float *t) {
                   &out->x, &out->y, &out->z, t) == 7;
 }
 
-/*
- * Read lines from 'fp' until one parses successfully or we hit EOF.
- * Returns 1 if a sample was produced, 0 at EOF.
- *
- * The loop body is deliberately minimal: we don't know how many garbage
- * lines might precede the next valid one, so we just keep going until we
- * find a good one. This makes the reader robust against headers, trailing
- * whitespace, and re-encoding artifacts.
- */
-static int readSample(FILE *fp, Vec3 *out, float *t) {
-    char line[512];
-    while (fgets(line, sizeof(line), fp)) {
-        if (parseLine(line, out, t)) return 1;
-    }
-    return 0;
-}
-
 /* ------------------------------------------------------------------ */
-/*  Playback helpers                                                  */
+/*  Trail + running mean                                              */
 /* ------------------------------------------------------------------ */
 
-/*
- * Append a sample to the trail.
- *
- * While the buffer isn't full, samples are stored in order. Once full, we
- * shift everything left by one and put the new sample at the end. This is
- * O(n) per sample, but n = MAX_TRAIL = 2000 floats * 3 = 24 KB memmove,
- * which is trivial at 20 Hz. A proper ring buffer with head/tail indices
- * would be O(1) and is the right answer at 100k+ samples; not worth the
- * added index arithmetic here.
- */
 static void pushTrail(Vec3 v) {
     if (trailCount < MAX_TRAIL) {
         trail[trailCount++] = v;
     } else {
-        /* Shift left by one slot. memmove is required rather than memcpy
-         * because source and destination overlap. */
         memmove(trail, trail + 1, (MAX_TRAIL - 1) * sizeof(Vec3));
         trail[MAX_TRAIL - 1] = v;
     }
 }
 
-/*
- * Update the running mean of |B|.
- *
- * Welford's incremental formula: mean += (x - mean) / n. Avoids accumulating
- * a running sum, which loses precision over long runs.
- */
 static void updateMeanMag(Vec3 v) {
     float m = sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
     magCount++;
@@ -158,46 +90,97 @@ static void updateMeanMag(Vec3 v) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Geometry drawing                                                  */
+/*  Line-buffered COM reader                                          */
 /* ------------------------------------------------------------------ */
 
 /*
- * Draw a wireframe sphere centered at c with radius r.
+ * The port gives us bytes, not lines. This struct accumulates bytes until
+ * a newline shows up, then hands the caller a complete line.
  *
- * Two families of curves:
- *   - Latitude rings: horizontal circles at different Y values
- *   - Longitude meridians: vertical half-circles connecting the poles
- *
- * Both are drawn as polylines of SEG segments. SEG=64 is enough that the
- * curves look smooth at any zoom level; more would just cost frame time.
- *
- * Don't use raylib's DrawCircle3D because it can't be offset along the
- * circle's own axis (needed for latitude rings at y != 0), and because we
- * want to hand-tune which rings/meridians get drawn.
+ * If the line buffer fills up without a newline (garbage, baud mismatch,
+ * or a device sending binary), we discard the buffer and start over. That
+ * keeps one bad stretch from wedging the parser forever.
  */
+typedef struct {
+    char  buf[LINE_BUF];
+    int   len;
+    int   discard;   /* 1 = we overflowed; skip bytes until next '\n' */
+} line_reader_t;
+
+static void lr_init(line_reader_t *lr) {
+    lr->len = 0;
+    lr->discard = 0;
+}
+
+/*
+ * Feed bytes from the port. Whenever a complete line is available, copy it
+ * into 'out' (null-terminated, newline stripped) and return 1.
+ * On no complete line, return 0. Any leftover bytes stay buffered.
+ *
+ * Caller loops this until it returns 0, to drain all complete lines from
+ * one read() call in case multiple arrived at once.
+ */
+static int lr_next(line_reader_t *lr, const unsigned char *chunk, int n,
+                   int *consumed, char *out, size_t out_sz) {
+    int i = *consumed;
+    while (i < n) {
+        unsigned char c = chunk[i++];
+
+        if (c == '\n') {
+            /* End of line. If we were discarding, reset and continue. */
+            if (lr->discard) {
+                lr->discard = 0;
+                lr->len = 0;
+                continue;
+            }
+            /* Copy out (strip trailing '\r' if present). */
+            int copy = lr->len;
+            if (copy > 0 && lr->buf[copy - 1] == '\r') copy--;
+            if ((size_t)copy >= out_sz) copy = (int)out_sz - 1;
+            memcpy(out, lr->buf, (size_t)copy);
+            out[copy] = '\0';
+            lr->len = 0;
+            *consumed = i;
+            return 1;
+        }
+
+        if (lr->discard) {
+            /* Still skipping until newline. */
+            continue;
+        }
+
+        if (lr->len < LINE_BUF - 1) {
+            lr->buf[lr->len++] = (char)c;
+        } else {
+            /* Overflow: too long without a newline. Start discarding. */
+            lr->discard = 1;
+            lr->len = 0;
+        }
+    }
+    *consumed = i;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Geometry drawing                                                  */
+/* ------------------------------------------------------------------ */
+
 static void drawRefSphere(Vector3 c, float r, int rings, int slices, Color col) {
     const int SEG = 64;
 
-    /* Latitude rings: phi goes from 0 (north pole) to PI (south pole).
-     * Skip i=0 and i=rings to avoid degenerate rings at the poles
-     * (radius zero → all points collapse to a single pixel). */
     for (int i = 1; i < rings; i++) {
         float phi = PI * (float)i / (float)rings;
-        float y   = cosf(phi) * r;      /* height of this ring above equator */
-        float rr  = sinf(phi) * r;      /* radius of this ring */
+        float y   = cosf(phi) * r;
+        float rr  = sinf(phi) * r;
         Vector3 prev = {0};
         for (int s = 0; s <= SEG; s++) {
             float t = 2.0f * PI * (float)s / (float)SEG;
             Vector3 p = { c.x + rr * cosf(t), c.y + y, c.z + rr * sinf(t) };
-            /* Draw a segment from previous point; skip on first iteration
-             * because prev hasn't been initialized meaningfully. */
             if (s > 0) DrawLine3D(prev, p, col);
             prev = p;
         }
     }
 
-    /* Longitude meridians: theta rotates the meridian plane around Y.
-     * Each meridian is a half-circle from +Y pole to -Y pole. */
     for (int j = 0; j < slices; j++) {
         float theta = PI * (float)j / (float)slices;
         float ct = cosf(theta), st = sinf(theta);
@@ -206,7 +189,6 @@ static void drawRefSphere(Vector3 c, float r, int rings, int slices, Color col) 
             float phi = PI * (float)s / (float)SEG;
             float y  =  cosf(phi) * r;
             float rr =  sinf(phi) * r;
-            /* The meridian lies in the plane spanned by (ct, 0, st) and Y. */
             Vector3 p = { c.x + rr * ct, c.y + y, c.z + rr * st };
             if (s > 0) DrawLine3D(prev, p, col);
             prev = p;
@@ -218,42 +200,35 @@ static void drawRefSphere(Vector3 c, float r, int rings, int slices, Color col) 
 /*  Entry point                                                       */
 /* ------------------------------------------------------------------ */
 
-int main(void) {
-    /* Request vsync (caps framerate to display refresh) and high-DPI
-     * awareness (Windows won't blur the window on high-resolution monitors).
-     * Must be called before InitWindow. */
-    SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI);
+int main(int argc, char **argv) {
+    /* Command line: program [port] [baud]. Defaults to COM3 @ 115200. */
+    const char *port = (argc > 1) ? argv[1] : DEFAULT_PORT;
+    unsigned    baud = (argc > 2) ? (unsigned)strtoul(argv[2], NULL, 10)
+                                  : DEFAULT_BAUD;
 
-    /* Create the OS window and an OpenGL context. Must be called before
-     * any raylib drawing function. */
-    InitWindow(1100, 750, "Magnetometer 3D");
-
-    /* Change the process's working directory to the resources/ folder,
-     * using a helper from the quickstart template. It locates the executable
-     * and walks up the tree looking for a folder named "resources".
-     * After this call, relative paths like "magnetometer_data.txt" resolve
-     * to resources/magnetometer_data.txt. */
-    SearchAndSetResourceDir("resources");
-
-    /* Open the data file for reading. Because of the chdir above, this path
-     * is relative to resources/. */
-    FILE *fp = fopen("magnetometer_data.txt", "r");
-    if (!fp) {
-        fprintf(stderr, "cannot open magnetometer_data.txt (CWD should be resources/)\n");
-        CloseWindow();
+    /* ------------------------------------------------------------------
+     * Open the COM port FIRST, before the window. If the port doesn't open,
+     * we want a clean error message, not a window flashing and disappearing.
+     * ------------------------------------------------------------------ */
+    comport_t *cp = comport_open(port, baud);
+    if (!cp) {
+        fprintf(stderr, "cannot open %s at %u baud\n", port, baud);
         return 1;
     }
+    printf("Opened %s. Waiting for data...\n", comport_name(cp));
 
-    /* Cap render loop at 60 fps. Playback is time-based (see simTimer below)
-     * so framerate doesn't affect how fast samples are consumed. */
+    /* ------------------------------------------------------------------
+     * raylib setup (unchanged from the file version, minus the file open)
+     * ------------------------------------------------------------------ */
+    SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI);
+    InitWindow(1100, 750, "Magnetometer 3D - live");
+
+    /* Only needed if you still want to load shaders or other assets from
+     * resources/. The data file is no longer read from disk. */
+    SearchAndSetResourceDir("resources");
+
     SetTargetFPS(60);
 
-    /* Camera setup. Camera3D is raylib's standard perspective camera.
-     * - position: where the eye is
-     * - target:   what it looks at (origin — the center of our vector space)
-     * - up:       which direction is "up" (Y-axis, standard for 3D views)
-     * - fovy:     vertical field of view in degrees
-     * - projection: PERSPECTIVE for natural depth, ORTHOGRAPHIC for diagrams */
     Camera3D cam = {
         .position   = { 6.0f, 4.5f, 6.0f },
         .target     = { 0.0f, 0.0f, 0.0f },
@@ -262,80 +237,78 @@ int main(void) {
         .projection = CAMERA_PERSPECTIVE,
     };
 
-    /* Playback clock. stepDt is the wall-clock interval between samples:
-     * 1/20 second at PLAYBACK_HZ=20. simTimer accumulates frame time and
-     * drains it in stepDt-sized chunks, so playback speed is independent
-     * of render rate. */
-    const float stepDt = 1.0f / PLAYBACK_HZ;
-    float simTimer = 0.0f;
-    int   eof      = 0;   /* becomes 1 once the file is exhausted */
+    static Vec3 earthRef = { 0.1890f, -0.4941f, -0.0316f };
 
-	/* 
-	* True reference field for Toronto, ON (~0.53 Total Gauss)
-	* Mapping to Raylib: 
-	*   X_raylib = North (~0.189G)
-	*   Y_raylib = Up (-Down Component = -0.494G)
-	*   Z_raylib = East (~-0.031G due to -9.5° West Declination)
-	*/
-	static Vec3 earthRef = { 0.1890f, -0.4941f, -0.0316f }; 
+    /* Line reader state, persists across frames. */
+    line_reader_t lr;
+    lr_init(&lr);
+
+    /* Stats for the HUD. */
+    unsigned long bytes_rx   = 0;
+    unsigned long samples_rx = 0;
+    unsigned long parse_fail = 0;
+
     /* ---------------- main loop ---------------- */
-    /* WindowShouldClose() returns true when the user clicks the close
-     * button or presses ESC. */
     while (!WindowShouldClose()) {
 
-        /* ---------- UPDATE ---------- */
+        /* ---------- UPDATE: drain the COM port ---------- */
 
-        /* Advance playback. Consume as many samples as the elapsed time
-         * permits — usually 0 or 1 per frame at 60 fps / 20 Hz playback,
-         * but the while loop handles slower frames correctly. */
-        if (!eof) {
-            simTimer += GetFrameTime();    /* seconds since last frame */
-            while (simTimer >= stepDt && !eof) {
-                simTimer -= stepDt;
+        /*
+         * Read from the port in a loop until it has nothing more for us.
+         * `comport_read` with a small timeout (0 = non-blocking) returns
+         * as soon as any bytes are available, or 0 immediately if nothing.
+         *
+         * The inner while handles the case where multiple samples arrive
+         * in one chunk (e.g., the STM32 buffered them during a slow frame).
+         */
+        unsigned char chunk[RX_CHUNK];
+        for (;;) {
+            int n = comport_read(cp, chunk, sizeof(chunk), 0);
+            if (n < 0) {
+                fprintf(stderr, "COM port lost.\n");
+                goto done;      /* exit the render loop */
+            }
+            if (n == 0) break;  /* nothing more right now */
+
+            bytes_rx += (unsigned long)n;
+
+            /* Feed the line reader. It may produce zero, one, or many
+             * complete lines from this chunk. */
+            int consumed = 0;
+            char line[LINE_BUF];
+            while (lr_next(&lr, chunk, n, &consumed, line, sizeof(line))) {
                 Vec3 v; float t;
-                if (readSample(fp, &v, &t)) {
+                if (parseLine(line, &v, &t)) {
                     current = v;
                     tempC   = t;
                     pushTrail(v);
                     updateMeanMag(v);
+                    samples_rx++;
                 } else {
-                    eof = 1;   /* stop advancing once the file runs out */
+                    parse_fail++;
                 }
             }
         }
 
-        /* Camera update. In current raylib, the mode is passed here rather
-         * than via a separate SetCameraMode call. CAMERA_ORBITAL gives us
-         * left-drag orbit, scroll zoom, right-drag pan for free. */
+        /* Camera update */
         UpdateCamera(&cam, CAMERA_ORBITAL);
 
         /* ---------- DRAW ---------- */
-
         BeginDrawing();
-        ClearBackground((Color){18, 18, 28, 255});   /* dark blue-gray */
+        ClearBackground((Color){18, 18, 28, 255});
 
         BeginMode3D(cam);
 
-        /* Static reference frame: a grid on the XZ plane, 10 units across,
-         * with 1-unit spacing. */
         DrawGrid(10, 1.0f);
 
-        /* Reference sphere at the running mean |B| radius. Using meanMag once
-         * we have samples means the sphere self-calibrates to the data. */
         float R = (meanMag > 0.0f ? meanMag : DEFAULT_REF_B) * SCALE;
         drawRefSphere((Vector3){0,0,0}, R, SPHERE_RINGS, SPHERE_SLICES,
-                      (Color){90, 90, 140, 90});   /* low alpha = ghostly */
+                      (Color){90, 90, 140, 90});
 
-        /* World axes for orientation. Red = X, green = Y, blue = Z.
-         * Length 2 world units so they don't compete visually with the
-         * data's ~4.6-unit radius. */
         DrawLine3D((Vector3){0,0,0}, (Vector3){2,0,0}, (Color){224, 85, 85, 255});
         DrawLine3D((Vector3){0,0,0}, (Vector3){0,2,0}, (Color){85, 224, 85, 255});
         DrawLine3D((Vector3){0,0,0}, (Vector3){0,0,2}, (Color){85, 136, 255, 255});
 
-        /* Trail: a polyline connecting past samples in order. Alpha fades
-         * with age so older parts of the trail recede visually. The alpha
-         * formula maps i∈[1,trailCount] to alpha∈[40,240]. */
         for (int i = 1; i < trailCount; i++) {
             Vector3 a = { trail[i-1].x*SCALE, trail[i-1].y*SCALE, trail[i-1].z*SCALE };
             Vector3 b = { trail[i  ].x*SCALE, trail[i  ].y*SCALE, trail[i  ].z*SCALE };
@@ -343,43 +316,40 @@ int main(void) {
             DrawLine3D(a, b, (Color){255, 200, 60, alpha});
         }
 
-        /* Current field vector: a yellow line from origin to the tip, an
-         * orange sphere at the tip to make its position obvious, and a small
-         * white sphere at the origin so the vector's base is visible. */
         Vector3 tip = { current.x*SCALE, current.y*SCALE, current.z*SCALE };
         DrawLine3D((Vector3){0,0,0}, tip, (Color){255, 220, 80, 255});
         DrawSphere(tip, 0.08f, (Color){255, 120, 40, 255});
         DrawSphere((Vector3){0,0,0}, 0.05f, RAYWHITE);
 
-		DrawLine3D((Vector3){0,0,0}, 
-		(Vector3){ earthRef.x * SCALE, earthRef.y * SCALE, earthRef.z * SCALE }, 
-		(Color){ 0, 200, 200, 255 }); // Cyan
-
-		// Optional: Add a small sphere at the tip for visibility
-		DrawSphere((Vector3){ earthRef.x * SCALE, earthRef.y * SCALE, earthRef.z * SCALE }, 
-				0.06f, (Color){ 0, 200, 200, 180 });
+        DrawLine3D((Vector3){0,0,0},
+            (Vector3){ earthRef.x * SCALE, earthRef.y * SCALE, earthRef.z * SCALE },
+            (Color){ 0, 200, 200, 255 });
+        DrawSphere((Vector3){ earthRef.x * SCALE, earthRef.y * SCALE, earthRef.z * SCALE },
+                   0.06f, (Color){ 0, 200, 200, 180 });
 
         EndMode3D();
 
         /* ---------- HUD ---------- */
-        /* 2D overlay drawn after EndMode3D, so coordinates are screen pixels
-         * (origin top-left, +Y down) not world units. */
         float mag = sqrtf(current.x*current.x + current.y*current.y + current.z*current.z);
         DrawText(TextFormat("gauss   X=%.4f  Y=%.4f  Z=%.4f", current.x, current.y, current.z), 10, 10, 20, RAYWHITE);
         DrawText(TextFormat("|B|     %.4f gauss", mag),     10, 35, 20, RAYWHITE);
         DrawText(TextFormat("mean|B| %.4f gauss", meanMag), 10, 60, 20, RAYWHITE);
         DrawText(TextFormat("temp    %.2f C",     tempC),   10, 85, 20, RAYWHITE);
-        DrawText(TextFormat("samples %d%s", trailCount, eof ? "  [EOF]" : ""), 10, 110, 20, LIGHTGRAY);
+        DrawText(TextFormat("samples %d  (rx %lu, parse-fail %lu)",
+                            trailCount, samples_rx, parse_fail),
+                 10, 110, 20, LIGHTGRAY);
+        DrawText(TextFormat("port %s  baud %u  bytes %lu",
+                            comport_name(cp), baud, bytes_rx),
+                 10, 135, 18, (Color){150, 170, 200, 255});
         DrawText("mouse: orbit   wheel: zoom   right-drag: pan",
                  10, 720, 18, (Color){150, 150, 170, 255});
 
         EndDrawing();
     }
 
+done:
     /* ---------------- cleanup ---------------- */
-    /* Free OS resources. Order matters for raylib: close the file, then the
-     * window (which tears down the GL context). */
-    fclose(fp);
+    comport_close(cp);
     CloseWindow();
     return 0;
 }
